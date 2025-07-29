@@ -2,150 +2,456 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>EUR/USD HH/HL Signal App</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EUR/USD Signal App</title>
   <style>
     body {
-      background: #0f0f0f;
-      color: #ffffff;
-      font-family: 'Segoe UI', sans-serif;
-      text-align: center;
-      padding: 2em;
+      font-family: Arial, sans-serif;
+      background: #f4f4f4;
+      padding: 20px;
+      transition: background 0.3s, color 0.3s;
     }
-    h1 { color: #00ffff; }
-    #price { font-size: 1.5em; margin-bottom: 1em; }
-    .signal { font-size: 2em; font-weight: bold; margin-bottom: 1em; }
-    .buy { color: #00ff00; }
-    .sell { color: #ff4444; }
-    .hold { color: #ffff00; }
-    .cancel { color: #8888ff; }
-    .info { font-size: 0.95em; color: #ccc; margin-top: 1em; line-height: 1.6em; }
+    body.dark {
+      background: #1e1e1e;
+      color: #f4f4f4;
+    }
+    .signal {
+      font-weight: bold;
+      padding: 10px;
+      border-radius: 5px;
+      transition: background 0.3s, color 0.3s;
+    }
+    .signal.active {
+      background: #c8f7c5;
+      color: #2d7a2d;
+    }
+    .signal.cancel {
+      background: #f7c5c5;
+      color: #7a2d2d;
+    }
+    .signal.neutral {
+      background: #e0e0e0;
+      color: #555;
+    }
+    .signal.dark.active {
+      background: #2d7a2d;
+      color: #c8f7c5;
+    }
+    .signal.dark.cancel {
+      background: #7a2d2d;
+      color: #f7c5c5;
+    }
+    .signal.dark.neutral {
+      background: #555;
+      color: #e0e0e0;
+    }
+    button {
+      margin-bottom: 15px;
+      padding: 8px 12px;
+      font-size: 14px;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
-  <h1>EUR/USD HH/HL Auto Signal</h1>
-  <div id="price">Fetching price...</div>
-  <div id="signal" class="signal">Loading signal...</div>
-  <div id="details" class="info"></div>
-  <div id="hhhl" class="info"></div>
+  <button onclick="toggleDarkMode()">Toggle Dark Mode</button>
+  <h2>EUR/USD Signal</h2>
+  <p id="price">Price: Loading...</p>
+  <p id="signal" class="signal neutral">Signal: Loading...</p>
+  <p id="strength">Signal Strength: --</p>
+  <p id="details">Entry / SL / TP: --</p>
+  <p id="hhhl">HH / HL: --</p>
+  <p id="trend">Trend: --</p>
+  <p id="volatility">Volatility (ATR): --</p>
+  <p id="lastUpdate">Last Update: --</p>
+  <p id="timeFilterStatus">Trading Hours: N/A</p>
+  <p id="htfTrend">HTF Trend: --</p>
+  <p id="rsiValue">RSI: --</p>
 
+
+  <div id="tv-chart" style="margin-top: 30px;"></div>
+
+  <script src="https://s3.tradingview.com/tv.js"></script>
   <script>
-    const API_KEY = 'GP02J90T64VUZ368';
+    // *****************************************************************************************
+    // WARNING: API KEY SECURITY
+    // Placing your API_KEY directly in client-side code (like this) is HIGHLY INSECURE.
+    // For any real-world application or live trading, you MUST move this to a secure
+    // backend server (Node.js, Python Flask, PHP, etc.) that acts as a proxy to the API.
+    // This protects your key from being exposed and misused.
+    // *****************************************************************************************
+    const API_KEY = '4857e3f57fee3f112ac6d737'; // Replace with your actual key
+
+    // Global variables for signal state
     let signal = null;
     let entryPrice = null;
     let sl = null;
     let tp = null;
     let signalTime = null;
-    const timeout = 300000;
-    const history = [];
 
-    async function fetchPrice() {
-      try {
-        const res = await fetch(`https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=EUR&to_currency=USD&apikey=${API_KEY}`);
-        const data = await res.json();
-        const price = parseFloat(data['Realtime Currency Exchange Rate']['5. Exchange Rate']);
-        document.getElementById('price').textContent = `Current Price: ${price.toFixed(4)}`;
+    // Data Storage
+    let history = []; // Stores recent price snapshots for general observation
+    // candleData stores simplified "OHLC" data (High, Low, Close) for ATR and candle confirmation
+    // Note: 'high' and 'low' here are just the snapshot price. For true OHLC, use a proper API.
+    let candleData = []; 
 
-        updateHistory(price);
-        const hh = Math.max(...history);
-        const hlCandidates = history.filter(p => p < hh);
-        const hl = hlCandidates.length ? Math.min(...hlCandidates) : price - 0.0030;
+    // Strategy Parameters (easily tunable)
+    const fetchIntervalMs = 180000; // 3 minutes for current API tier (180000ms)
+    const cooldownMinutes = 10;     // Cooldown period for new signals
+    const breakoutLookback = 5;     // Number of recent candles for HH/HL breakout check (your original 5)
+    
+    // ATR Parameters
+    const atrPeriod = 14;           // Period for ATR calculation
+    const atrMultiplier = 2;        // Multiplier for ATR-based stop loss (e.g., 2x ATR)
+    const minVolatilityATR = 0.00005; // Minimum ATR threshold for a valid signal
 
-        const ll = Math.min(...history);
-        const lhCandidates = history.filter(p => p > ll);
-        const lh = lhCandidates.length ? Math.max(...lhCandidates) : price + 0.0030;
+    // Candle Confirmation Parameters
+    const minBodyRatio = 0.5;       // Minimum candle body size as a percentage of its total range
 
-        const volatility = hh - ll;
-        const isUptrend = hh > history[1] && hl > history[1];
-        const isDowntrend = ll < history[1] && lh < history[1];
+    // RSI Parameters
+    const rsiPeriod = 14;           // Period for RSI calculation
+    const rsiOverbought = 70;       // RSI overbought threshold
+    const rsiOversold = 30;         // RSI oversold threshold
 
-        const now = Date.now();
-        let status = '';
-        let signalClass = '';
-        let strength = '';
+    // Multi-Timeframe (HTF) Parameters (simulated from LTF data)
+    // Adjusted for Hybrid Filter: Smaller lookback for "HTF" to speed up startup
+    const htfShortPeriod = 20; // Short-term average for hybrid HTF (e.g., 20 candles)
+    const htfLongPeriod = 40;  // Longer-term average for hybrid HTF (e.g., 40 candles)
+    // The maximum candles needed for any calculation will now be htfLongPeriod
+    const maxCandleDataLength = Math.max(atrPeriod, rsiPeriod, htfLongPeriod) + 5;
 
-        if (volatility < 0.0010) {
-          status = 'Low volatility. Signal paused.';
-          signalClass = 'hold';
-        } else if (!signal && price < hl && isUptrend) {
-          signal = 'BUY';
-          entryPrice = price;
-          sl = hl;
-          tp = hh > price ? hh : price + 0.0040;
-          signalTime = now;
-          const rr = (tp - entryPrice) / (entryPrice - sl);
-          strength = rr > 2 ? '★★★★☆' : rr > 1.5 ? '★★★☆☆' : '★★☆☆☆';
-          status = `BUY triggered at ${entryPrice.toFixed(4)} | SL: ${sl.toFixed(4)} | TP: ${tp.toFixed(4)} | Strength: ${strength}`;
-          signalClass = 'buy';
-        } else if (!signal && price > lh && isDowntrend) {
-          signal = 'SELL';
-          entryPrice = price;
-          sl = lh;
-          tp = ll < price ? ll : price - 0.0040;
-          signalTime = now;
-          const rr = (entryPrice - tp) / (sl - entryPrice);
-          strength = rr > 2 ? '★★★★☆' : rr > 1.5 ? '★★★☆☆' : '★★☆☆☆';
-          status = `SELL triggered at ${entryPrice.toFixed(4)} | SL: ${sl.toFixed(4)} | TP: ${tp.toFixed(4)} | Strength: ${strength}`;
-          signalClass = 'sell';
-        } else if (signal && now - signalTime > timeout) {
-          status = `SIGNAL CANCELED (Timeout)`;
-          signalClass = 'cancel';
-          resetSignal();
-        } else if (signal === 'BUY') {
-          if (price <= sl) {
-            status = `STOP LOSS HIT at ${price.toFixed(4)}`;
-            signalClass = 'sell';
-            resetSignal();
-          } else if (price >= tp) {
-            status = `TAKE PROFIT HIT at ${price.toFixed(4)}`;
-            signalClass = 'buy';
-            resetSignal();
-          } else {
-            status = `TRADE ACTIVE | Entry: ${entryPrice.toFixed(4)} | SL: ${sl.toFixed(4)} | TP: ${tp.toFixed(4)} | Strength: ${strength}`;
-            signalClass = 'buy';
-          }
-        } else if (signal === 'SELL') {
-          if (price >= sl) {
-            status = `STOP LOSS HIT at ${price.toFixed(4)}`;
-            signalClass = 'buy';
-            resetSignal();
-          } else if (price <= tp) {
-            status = `TAKE PROFIT HIT at ${price.toFixed(4)}`;
-            signalClass = 'sell';
-            resetSignal();
-          } else {
-            status = `TRADE ACTIVE | Entry: ${entryPrice.toFixed(4)} | SL: ${sl.toFixed(4)} | TP: ${tp.toFixed(4)} | Strength: ${strength}`;
-            signalClass = 'sell';
-          }
-        } else if (!signal) {
-          status = `No signal. Waiting for HH/HL trigger...`;
-          signalClass = 'hold';
+
+    // Load persisted data from local storage
+    const storedHistory = localStorage.getItem('priceHistory');
+    if (storedHistory) history = JSON.parse(storedHistory);
+    const storedCandleData = localStorage.getItem('candleData');
+    if (storedCandleData) candleData = JSON.parse(storedCandleData);
+
+    /**
+     * Calculates the True Range for a single period.
+     * @param {number} currentHigh The high price of the current period.
+     * @param {number} currentLow The low price of the current period.
+     * @param {number} previousClose The closing price of the previous period.
+     * @returns {number} The True Range.
+     */
+    function calculateTrueRange(currentHigh, currentLow, previousClose) {
+        const tr1 = currentHigh - currentLow;
+        const tr2 = Math.abs(currentHigh - previousClose);
+        const tr3 = Math.abs(currentLow - previousClose);
+        return Math.max(tr1, tr2, tr3);
+    }
+
+    /**
+     * Calculates the Average True Range (ATR) using a simple moving average of True Ranges.
+     * Note: This is a simplified SMA-like ATR, not Wilder's exponentially smoothed ATR.
+     * @param {Array<Object>} data An array of candle objects ({high, low, close, previousClose}).
+     * @param {number} period The number of periods for the ATR calculation.
+     * @returns {number} The calculated ATR value.
+     */
+    function calculateATR(data, period) {
+        if (data.length <= period) return 0;
+
+        const trueRanges = [];
+        // Iterate from most recent to older for TR calculation
+        for (let i = 0; i < data.length - 1; i++) {
+            const currentCandle = data[i];
+            const previousCloseForTR = data[i + 1].close; 
+            const tr = calculateTrueRange(currentCandle.high, currentCandle.low, previousCloseForTR);
+            trueRanges.push(tr);
+        }
+        
+        if (trueRanges.length < period) return 0;
+
+        const recentTrueRanges = trueRanges.slice(0, period); 
+        const sumRecentTrueRanges = recentTrueRanges.reduce((a, b) => a + b, 0);
+        return sumRecentTrueRanges / period;
+    }
+
+    /**
+     * Calculates the Relative Strength Index (RSI).
+     * @param {Array<Object>} data An array of candle objects ({high, low, close}).
+     * @param {number} period The RSI period.
+     * @returns {number} The calculated RSI value, or NaN if not enough data.
+     */
+    function calculateRSI(data, period) {
+        if (data.length < period + 1) return NaN; // Need period + 1 closes for initial calculation
+
+        // Ensure we have enough data for the RSI period + the initial average calculation
+        const closes = data.slice(0, period + 1).map(c => c.close).reverse(); // Get recent closes, oldest first
+        
+        let gains = [];
+        let losses = [];
+
+        for (let i = 1; i < closes.length; i++) {
+            const diff = closes[i] - closes[i - 1];
+            gains.push(Math.max(0, diff));
+            losses.push(Math.max(0, -diff));
         }
 
-        document.getElementById('signal').textContent = signal || 'HOLD';
-        document.getElementById('signal').className = `signal ${signalClass}`;
-        document.getElementById('details').textContent = status;
+        // Calculate initial average gain/loss over the first 'period'
+        let avgGain = gains.slice(0, period).reduce((a, b) => a + b, 0) / period;
+        let avgLoss = losses.slice(0, period).reduce((a, b) => a + b, 0) / period;
 
-        document.getElementById('hhhl').innerHTML = `
-          HH: ${hh.toFixed(4)} | HL: ${hl.toFixed(4)}<br>
-          LH: ${lh.toFixed(4)} | LL: ${ll.toFixed(4)}<br>
-          SL: ${sl ? sl.toFixed(4) : '—'} | TP: ${tp ? tp.toFixed(4) : '—'}<br>
-          Volatility: ${volatility.toFixed(4)} | Trend: ${isUptrend ? 'Uptrend' : isDowntrend ? 'Downtrend' : 'Sideways'}
-        `;
-      } catch (error) {
-        document.getElementById('price').textContent = 'Error fetching price';
+        // Subsequent RSI smoothing (Wilder's smoothing)
+        for (let i = period; i < gains.length; i++) { // This loop won't run if data.length is just period+1
+            avgGain = ((avgGain * (period - 1)) + gains[i]) / period;
+            avgLoss = ((avgLoss * (period - 1)) + losses[i]) / period;
+        }
+
+        const rs = avgGain / (avgLoss || 0.0000001); // Avoid division by zero
+        return 100 - (100 / (1 + rs));
+    }
+
+    /**
+     * Calculates a simple moving average of closing prices.
+     * @param {Array<Object>} data An array of candle objects ({close}).
+     * @param {number} period The number of periods for the SMA.
+     * @returns {number} The calculated SMA value.
+     */
+    function calculateSMA(data, period) {
+        if (data.length < period) return NaN;
+        const closes = data.slice(0, period).map(c => c.close);
+        const sum = closes.reduce((a, b) => a + b, 0);
+        return sum / period;
+    }
+
+
+    /**
+     * Fetches the current EUR/USD price, updates historical data, calculates signals,
+     * and updates the UI.
+     */
+    async function fetchPrice() {
+        const apiUrl = `https://v6.exchangerate-api.com/v6/${API_KEY}/latest/EUR`;
+        let currentPrice;
+
+        try {
+            const response = await fetch(apiUrl);
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(`API error: ${errorData.result || response.status} - ${errorData['error-type'] || response.statusText}`);
+            }
+
+            const data = await response.json();
+
+            if (data.result === 'success' && data.conversion_rates && data.conversion_rates.USD) {
+                currentPrice = data.conversion_rates.USD;
+            } else {
+                throw new Error('Invalid API response format or USD currency not found.');
+            }
+
+            // --- Update candleData (simplified OHLC) and general price history ---
+            const previousCloseForTR = candleData.length > 0 ? candleData[0].close : currentPrice;
+            
+            // Create a simplified 'candle' object for the current fetch interval.
+            // 'open' is a proxy (previous close) for body calculation.
+            const currentCandle = {
+                high: currentPrice, 
+                low: currentPrice,  
+                close: currentPrice,
+                open: previousCloseForTR 
+            };
+            candleData.unshift(currentCandle); 
+            // Keep enough data for ATR + RSI + HTF lookbacks + a small buffer
+            // Now based on htfLongPeriod for the hybrid filter
+            if (candleData.length > maxCandleDataLength) candleData.pop(); 
+            localStorage.setItem('candleData', JSON.stringify(candleData));
+
+            updateHistory(currentPrice); 
+
+            // --- Time-of-Day Filter ---
+            const nowUTC = new Date();
+            const hourUTC = nowUTC.getUTCHours();
+            // London session (8-17 UTC), New York session (13-22 UTC)
+            // Active hours: 8:00 UTC to 21:00 UTC (inclusive) for good liquidity
+            const isGoodTradingHour = (hourUTC >= 8 && hourUTC <= 21);
+            document.getElementById('timeFilterStatus').textContent = `Trading Hours (UTC): ${isGoodTradingHour ? 'Active' : 'Quiet'}`;
+
+            if (!isGoodTradingHour) {
+                document.getElementById('price').textContent = `Price: ${currentPrice.toFixed(4)}`;
+                document.getElementById('signal').textContent = 'Signal: Outside Trading Hours';
+                document.getElementById('signal').className = 'signal neutral' + (document.body.classList.contains('dark') ? ' dark' : '');
+                document.getElementById('strength').textContent = 'Signal Strength: --';
+                document.getElementById('details').textContent = 'Waiting for active trading session.';
+                document.getElementById('hhhl').textContent = 'HH / HL: --';
+                document.getElementById('trend').textContent = 'Trend: --';
+                document.getElementById('volatility').textContent = 'Volatility (ATR): --';
+                document.getElementById('rsiValue').textContent = 'RSI: --';
+                document.getElementById('htfTrend').textContent = 'HTF Trend: --';
+                document.getElementById('lastUpdate').textContent = `Last Update: ${nowUTC.toLocaleTimeString()}`;
+                resetSignal(); 
+                return; // Skip signal generation
+            }
+
+
+            // --- Signal Calculation Logic ---
+            // Check for sufficient data for all calculations
+            // Data needed for HTF filter is htfLongPeriod
+            if (candleData.length < maxCandleDataLength) { 
+                document.getElementById('price').textContent = `Price: ${currentPrice.toFixed(4)}`;
+                document.getElementById('signal').textContent = 'Gathering Data...';
+                document.getElementById('signal').className = 'signal neutral' + (document.body.classList.contains('dark') ? ' dark' : '');
+                document.getElementById('strength').textContent = 'Signal Strength: --';
+                document.getElementById('details').textContent = `Need ${maxCandleDataLength - candleData.length} more periods for calculations. (Min ${maxCandleDataLength})`;
+                document.getElementById('hhhl').textContent = 'HH / HL: --';
+                document.getElementById('trend').textContent = 'Trend: --';
+                document.getElementById('volatility').textContent = 'Volatility (ATR): --';
+                document.getElementById('rsiValue').textContent = 'RSI: --';
+                document.getElementById('htfTrend').textContent = 'HTF Trend: --';
+                document.getElementById('lastUpdate').textContent = `Last Update: ${nowUTC.toLocaleTimeString()}`;
+                return; 
+            }
+
+            // Calculate current ATR
+            const currentATR = calculateATR(candleData, atrPeriod);
+            
+            // Calculate RSI
+            const currentRSI = calculateRSI(candleData, rsiPeriod);
+
+            // Use the 'breakoutLookback' most recent prices for a simple HH/HL and LTF trend detection
+            const recentPricesForHHHL = history.slice(0, breakoutLookback); 
+            const hh = Math.max(...recentPricesForHHHL);    
+            const hl = Math.min(...recentPricesForHHHL);    
+            
+            // LTF Trend detection: Compare the oldest price in the breakoutLookback window with the newest
+            const isLTFUptrend = recentPricesForHHHL[0] < recentPricesForHHHL[breakoutLookback - 1];
+            const isLTFDowntrend = recentPricesForHHHL[0] > recentPricesForHHHL[breakoutLookback - 1];
+            
+            // --- Hybrid HTF Trend Filter ---
+            let htfTrendStatus = 'Neutral';
+            let isHTFUptrend = false;
+            let isHTFDowntrend = false;
+
+            const shortMA = calculateSMA(candleData, htfShortPeriod);
+            const longMA = calculateSMA(candleData, htfLongPeriod);
+
+            if (!isNaN(shortMA) && !isNaN(longMA)) {
+                if (shortMA > longMA) {
+                    isHTFUptrend = true;
+                    htfTrendStatus = 'Uptrend';
+                } else if (shortMA < longMA) {
+                    isHTFDowntrend = true;
+                    htfTrendStatus = 'Downtrend';
+                } else {
+                    htfTrendStatus = 'Sideways'; // MAs are equal
+                }
+            } else {
+                htfTrendStatus = 'Insufficient Data for Hybrid MA';
+            }
+
+
+            // --- Candle Body Confirmation ---
+            const bodySize = Math.abs(currentCandle.close - currentCandle.open); 
+            const candleRange = currentCandle.high - currentCandle.low;
+            const bodyRatio = candleRange > 0 ? bodySize / candleRange : 0;
+            const isStrongCandle = bodyRatio >= minBodyRatio;
+
+
+            const now = new Date(); // Get current time for cooldown check
+            const lastSignalTime = signalTime ? new Date(signalTime) : null;
+            const minutesSinceSignal = lastSignalTime ? (now - lastSignalTime) / 60000 : Infinity;
+
+            // Check for new signal only if cooldown period has passed or there's no active signal
+            if (minutesSinceSignal >= cooldownMinutes || !signal) {
+                let newSignal = null;
+
+                // BUY Signal Conditions:
+                // 1. LTF Uptrend
+                // 2. Current candle close breaks above HH
+                // 3. Sufficient volatility (ATR)
+                // 4. Strong candle body
+                // 5. HTF is Uptrend or Neutral (based on hybrid MA)
+                // 6. RSI not Overbought (and ideally confirming bullish momentum, i.e., > 50)
+                if (isLTFUptrend && currentCandle.close > hh && currentATR > minVolatilityATR && isStrongCandle &&
+                    (isHTFUptrend || htfTrendStatus === 'Sideways') && currentRSI < rsiOverbought && currentRSI >= 50 ) { 
+                    newSignal = 'BUY';
+                } 
+                // SELL Signal Conditions:
+                // 1. LTF Downtrend
+                // 2. Current candle close breaks below HL
+                // 3. Sufficient volatility (ATR)
+                // 4. Strong candle body
+                // 5. HTF is Downtrend or Neutral (based on hybrid MA)
+                // 6. RSI not Oversold (and ideally confirming bearish momentum, i.e., < 50)
+                else if (isLTFDowntrend && currentCandle.close < hl && currentATR > minVolatilityATR && isStrongCandle &&
+                         (isHTFDowntrend || htfTrendStatus === 'Sideways') && currentRSI > rsiOversold && currentRSI <= 50) { 
+                    newSignal = 'SELL';
+                }
+
+                // If a new valid signal is generated, update state
+                if (newSignal) {
+                    signal = newSignal;
+                    entryPrice = currentCandle.close; // Entry price is the close of the confirming candle
+                    sl = (signal === 'BUY') ? entryPrice - (currentATR * atrMultiplier) : entryPrice + (currentATR * atrMultiplier);
+                    tp = (signal === 'BUY') ? entryPrice + (2 * (entryPrice - sl)) : entryPrice - (2 * (sl - entryPrice));
+                    signalTime = now.toISOString();
+                } else {
+                    // If conditions for a new signal are not met, reset any previous active signal
+                    resetSignal();
+                }
+            }
+
+            // Determine Signal Strength based on ATR (adjust thresholds as needed for EUR/USD)
+            let strength = 'Weak';
+            if (currentATR > 0.0001) strength = 'Strong';
+            else if (currentATR > 0.00007) strength = 'Moderate';
+
+            // --- Update UI ---
+            document.getElementById('price').textContent = `Price: ${currentPrice.toFixed(4)}`;
+            document.getElementById('signal').textContent = `Signal: ${signal || 'SIDEWAYS'}`;
+            document.getElementById('signal').className =
+              (signal === 'BUY' || signal === 'SELL' ? 'signal active' :
+              signal === 'ERROR' ? 'signal cancel' : 'signal neutral') +
+              (document.body.classList.contains('dark') ? ' dark' : '');
+            document.getElementById('strength').textContent = `Signal Strength: ${strength}`;
+            document.getElementById('details').textContent =
+              signal === 'BUY' || signal === 'SELL'
+                ? `Entry: ${entryPrice.toFixed(4)} | SL: ${sl.toFixed(4)} | TP: ${tp.toFixed(4)}`
+                : 'No clear signal';
+            document.getElementById('hhhl').textContent = `HH: ${hh.toFixed(4)} | HL: ${hl.toFixed(4)}`;
+            document.getElementById('trend').textContent = `LTF Trend: ${isLTFUptrend ? 'Uptrend' : isLTFDowntrend ? 'Downtrend' : 'Sideways'}`;
+            document.getElementById('volatility').textContent = `Volatility (ATR ${atrPeriod}): ${currentATR.toFixed(6)}`;
+            document.getElementById('rsiValue').textContent = `RSI (${rsiPeriod}): ${!isNaN(currentRSI) ? currentRSI.toFixed(2) : '--'}`;
+            document.getElementById('htfTrend').textContent = `HTF Trend (SMA ${htfShortPeriod}/${htfLongPeriod}): ${htfTrendStatus}`;
+            document.getElementById('lastUpdate').textContent = `Last Update: ${nowUTC.toLocaleTimeString()}`;
+
+        } catch (error) {
+            console.error('Fetch error:', error);
+            displayError(`Error fetching price: ${error.message}. Please check API key or network.`);
+        }
+    }
+
+    /**
+     * Displays an error message in the UI and resets signal display.
+     * @param {string} message The error message to display.
+     */
+    function displayError(message) {
+        document.getElementById('price').textContent = message;
         document.getElementById('signal').textContent = 'ERROR';
-        document.getElementById('signal').className = 'signal cancel';
-        document.getElementById('details').textContent = error.message;
+        document.getElementById('signal').className = 'signal cancel' + (document.body.classList.contains('dark') ? ' dark' : '');
+        document.getElementById('strength').textContent = 'Signal Strength: --';
+        document.getElementById('details').textContent = 'Cannot determine signal due to error.';
         document.getElementById('hhhl').textContent = '';
-      }
+        document.getElementById('trend').textContent = '';
+        document.getElementById('volatility').textContent = '';
+        document.getElementById('rsiValue').textContent = '';
+        document.getElementById('htfTrend').textContent = '';
+        document.getElementById('lastUpdate').textContent = '';
+        document.getElementById('timeFilterStatus').textContent = 'Trading Hours: Error';
     }
 
+    /**
+     * Adds the current price to the history array and maintains a maximum length.
+     * @param {number} price The current EUR/USD price.
+     */
     function updateHistory(price) {
-      history.unshift(price);
-      if (history.length > 10) history.pop();
+      history.unshift(price); 
+      if (history.length > 10) history.pop(); // Keeping this for the simple trend calc based on 5 recent points
+      localStorage.setItem('priceHistory', JSON.stringify(history)); 
     }
-
+    
+    /**
+     * Resets all signal-related variables to a neutral state.
+     */
     function resetSignal() {
       signal = null;
       entryPrice = null;
@@ -154,8 +460,33 @@
       signalTime = null;
     }
 
+    /**
+     * Toggles dark mode on and off for the body and signal element.
+     */
+    function toggleDarkMode() {
+      document.body.classList.toggle('dark');
+      const signalEl = document.getElementById('signal');
+      signalEl.classList.toggle('dark'); 
+    }
+
+    // --- Application Initialization ---
+    // Initial fetch when the page loads
     fetchPrice();
-    setInterval(fetchPrice, 180000);
+    // Set up interval for subsequent fetches
+    setInterval(fetchPrice, fetchIntervalMs); 
+
+    // Initialize TradingView Widget for visual reference
+    new TradingView.widget({
+      "width": 600,
+      "height": 400,
+      "symbol": "FX:EURUSD",
+      "interval": "15", // TradingView chart interval (15-minute candles)
+      "timezone": "Etc/UTC", 
+      "theme": "light", 
+      "style": "1", 
+      "locale": "en", 
+      "container_id": "tv-chart" 
+    });
   </script>
 </body>
 </html>
