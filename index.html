@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>EUR/USD HH/HL Signal App</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      background: #0f0f0f;
+      color: #ffffff;
+      font-family: 'Segoe UI', sans-serif;
+      text-align: center;
+      padding: 2em;
+    }
+    h1 { color: #00ffff; }
+    #price { font-size: 1.5em; margin-bottom: 1em; }
+    .signal { font-size: 2em; font-weight: bold; margin-bottom: 1em; }
+    .buy { color: #00ff00; }
+    .sell { color: #ff4444; }
+    .hold { color: #ffff00; }
+    .cancel { color: #8888ff; }
+    .info { font-size: 0.95em; color: #ccc; margin-top: 1em; line-height: 1.6em; }
+    .toggle {
+      margin-top: 1em;
+      font-size: 1em;
+      color: #ccc;
+    }
+  </style>
+</head>
+<body>
+  <h1>EUR/USD HH/HL Auto Signal</h1>
+  <div id="price">Fetching price...</div>
+  <div id="signal" class="signal">Loading signal...</div>
+  <div id="details" class="info"></div>
+  <div id="hhhl" class="info"></div>
+  <div class="toggle">
+    <label>
+      <input type="checkbox" id="autoToggle" checked>
+      Auto-send Telegram alerts
+    </label>
+  </div>
+
+  <script>
+    const API_KEY = 'GP02J90T64VUZ368';
+    const token = '7968392339:AAFHa9FTHXh8UJz6iw3p5UkdkOkMkjQWBGM'; // Replace if regenerated
+    const chatId = 780514034;
+
+    let signal = null;
+    let entryPrice = null;
+    let sl = null;
+    let tp = null;
+    let signalTime = null;
+    const timeout = 300000;
+    const history = [];
+
+    function sendTelegramAlert(message) {
+      const autoEnabled = document.getElementById("autoToggle").checked;
+      if (!autoEnabled) return;
+
+      fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: message })
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.ok) {
+          console.log("✅ Telegram alert sent");
+        } else {
+          console.error("❌ Telegram alert failed", data);
+        }
+      });
+    }
+
+    async function fetchPrice() {
+      try {
+        const res = await fetch(`https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=EUR&to_currency=USD&apikey=${API_KEY}`);
+        const data = await res.json();
+        const price = parseFloat(data['Realtime Currency Exchange Rate']['5. Exchange Rate']);
+        document.getElementById('price').textContent = `Current Price: ${price.toFixed(4)}`;
+
+        updateHistory(price);
+        const hh = Math.max(...history);
+        const hlCandidates = history.filter(p => p < hh);
+        const hl = hlCandidates.length ? Math.min(...hlCandidates) : price - 0.0030;
+
+        const ll = Math.min(...history);
+        const lhCandidates = history.filter(p => p > ll);
+        const lh = lhCandidates.length ? Math.max(...lhCandidates) : price + 0.0030;
+
+        const volatility = hh - ll;
+        const isUptrend = hh > history[1] && hl > history[1];
+        const isDowntrend = ll < history[1] && lh < history[1];
+
+        const now = Date.now();
+        let status = '';
+        let signalClass = '';
+        let strength = '';
+
+        if (volatility < 0.0010) {
+          status = 'Low volatility. Signal paused.';
+          signalClass = 'hold';
+        } else if (!signal && price < hl && isUptrend) {
+          signal = 'BUY';
+          entryPrice = price;
+          sl = hl;
+          tp = hh > price ? hh : price + 0.0040;
+          signalTime = now;
+          const rr = (tp - entryPrice) / (entryPrice - sl);
+          strength = rr > 2 ? '★★★★☆' : rr > 1.5 ? '★★★☆☆' : '★★☆☆☆';
+          status = `BUY triggered at ${entryPrice.toFixed(4)} | SL: ${sl.toFixed(4)} | TP: ${tp.toFixed(4)} | Strength: ${strength}`;
+          signalClass = 'buy';
+          sendTelegramAlert(`🚨 BUY Signal\nEntry: ${entryPrice.toFixed(4)}\nSL: ${sl.toFixed(4)}\nTP: ${tp.toFixed(4)}\nStrength: ${strength}`);
+        } else if (!signal && price > lh && isDowntrend) {
+          signal = 'SELL';
+          entryPrice = price;
+          sl = lh;
+          tp = ll < price ? ll : price - 0.0040;
+          signalTime = now;
+          const rr = (entryPrice - tp) / (sl - entryPrice);
+          strength = rr > 2 ? '★★★★☆' : rr > 1.5 ? '★★★☆☆' : '★★☆☆☆';
+          status = `SELL triggered at ${entryPrice.toFixed(4)} | SL: ${sl.toFixed(4)} | TP: ${tp.toFixed(4)} | Strength: ${strength}`;
+          signalClass = 'sell';
+          sendTelegramAlert(`🚨 SELL Signal\nEntry: ${entryPrice.toFixed(4)}\nSL: ${sl.toFixed(4)}\nTP: ${tp.toFixed(4)}\nStrength: ${strength}`);
+        } else if (signal && now - signalTime > timeout) {
+          status = `SIGNAL CANCELED (Timeout)`;
+          signalClass = 'cancel';
+          sendTelegramAlert(`⏱️ Signal Canceled\nPrevious Entry: ${entryPrice.toFixed(4)}`);
+          resetSignal();
+        } else if (signal === 'BUY') {
+          if (price <= sl) {
+            status = `STOP LOSS HIT at ${price.toFixed(4)}`;
+            signalClass = 'sell';
+            sendTelegramAlert(`⚠️ BUY Trade Closed\nReason: STOP LOSS\nPrice: ${price.toFixed(4)}`);
+            resetSignal();
+          } else if (price >= tp) {
+            status = `TAKE PROFIT HIT at ${price.toFixed(4)}`;
+            signalClass = 'buy';
+            sendTelegramAlert(`✅ BUY Trade Closed\nReason: TAKE PROFIT\nPrice: ${price.toFixed(4)}`);
+            resetSignal();
+          } else {
+            status = `TRADE ACTIVE | Entry: ${entryPrice.toFixed(4)} | SL: ${sl.toFixed(4)} | TP: ${tp.toFixed(4)} | Strength: ${strength}`;
+            signalClass = 'buy';
+          }
+        } else if (signal === 'SELL') {
+          if (price >= sl) {
+            status = `STOP LOSS HIT at ${price.toFixed(4)}`;
+            signalClass = 'buy';
+            sendTelegramAlert(`⚠️ SELL Trade Closed\nReason: STOP LOSS\nPrice: ${price.toFixed(4)}`);
+            resetSignal();
+          } else if (price <= tp) {
+            status = `TAKE PROFIT HIT at ${price.toFixed(4)}`;
+            signalClass = 'sell';
+            sendTelegramAlert(`✅ SELL Trade Closed\nReason: TAKE PROFIT\nPrice: ${price.toFixed(4)}`);
+            resetSignal();
+          } else {
+            status = `TRADE ACTIVE | Entry: ${entryPrice.toFixed(4)} | SL: ${sl.toFixed(4)} | TP: ${tp.toFixed(4)} | Strength: ${strength}`;
+            signalClass = 'sell';
+          }
+        } else if (!signal) {
+          status = `No signal. Waiting for HH/HL trigger...`;
+          signalClass = 'hold';
+        }
+
+        document.getElementById('signal').textContent = signal || 'HOLD';
+        document.getElementById('signal').className = `signal ${signalClass}`;
+        document.getElementById('details').textContent = status;
+
+        document.getElementById('hhhl').innerHTML = `
+          HH: ${hh.toFixed(4)} | HL: ${hl.toFixed(4)}<br>
+          LH: ${lh.toFixed(4)} | LL: ${ll.toFixed(4)}<br>
+          SL: ${sl ? sl.toFixed(4) : '—'} | TP: ${tp ? tp.toFixed(4) : '—'}<br>
+          Volatility: ${volatility.toFixed(4)} | Trend: ${isUptrend ? 'Uptrend' : isDowntrend ? 'Downtrend' : 'Sideways'}
+        `;
+      } catch (error) {
+        document.getElementById('price').textContent = 'Error fetching price';
+        document.getElementById('signal').textContent = 'ERROR';
+        document.getElementById('signal').className = 'signal cancel';
+        document.getElementById('details').textContent = error.message;
+        document.getElementById('hhhl').textContent = '';
+      }
+    }
+
+    function updateHistory(price) {
+      history.unshift(price);
+      if (history.length > 10) history.pop();
+    }
+
+    function resetSignal() {
+      signal = null;
+      entryPrice = null;
+      sl = null;
+      tp = null;
+      signalTime = null;
+    }
+
+    fetchPrice();
+    setInterval(fetchPrice, 180000); // every 3 minutes
+  </script>
+</body>
+</html>
